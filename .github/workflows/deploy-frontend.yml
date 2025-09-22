@@ -129,9 +129,51 @@ jobs:
           --source-version '$Latest' \
           --launch-template-data "{\"ImageId\":\"ami-0866a3c8686eaeeba\",\"UserData\":\"$USER_DATA\"}"
 
-    - name: Start instance refresh
+    - name: Handle existing instance refresh and start new one
       run: |
-        echo "Starting instance refresh for ASG: $ASG_NAME"
+        echo "Checking for existing instance refreshes for ASG: $ASG_NAME"
+        
+        # Check if there's an existing instance refresh in progress
+        EXISTING_REFRESH=$(aws autoscaling describe-instance-refreshes \
+          --auto-scaling-group-name $ASG_NAME \
+          --query 'InstanceRefreshes[?Status==`InProgress` || Status==`Pending`] | [0].InstanceRefreshId' \
+          --output text 2>/dev/null || echo "None")
+        
+        if [ "$EXISTING_REFRESH" != "None" ] && [ "$EXISTING_REFRESH" != "null" ]; then
+          echo "Found existing instance refresh: $EXISTING_REFRESH"
+          
+          # Cancel the existing refresh
+          echo "Cancelling existing instance refresh..."
+          aws autoscaling cancel-instance-refresh \
+            --auto-scaling-group-name $ASG_NAME \
+            --instance-refresh-id $EXISTING_REFRESH
+          
+          # Wait for cancellation to complete
+          echo "Waiting for cancellation to complete..."
+          while true; do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name $ASG_NAME \
+              --instance-refresh-ids $EXISTING_REFRESH \
+              --query 'InstanceRefreshes[0].Status' \
+              --output text 2>/dev/null || echo "NotFound")
+            
+            echo "Cancellation status: $STATUS"
+            
+            if [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "NotFound" ]; then
+              echo "Previous refresh cancelled/completed"
+              break
+            fi
+            
+            sleep 10
+          done
+          
+          # Wait a bit more to ensure AWS is ready
+          sleep 5
+        else
+          echo "No existing instance refresh found"
+        fi
+        
+        echo "Starting new instance refresh for ASG: $ASG_NAME"
         
         REFRESH_ID=$(aws autoscaling start-instance-refresh \
           --auto-scaling-group-name $ASG_NAME \
