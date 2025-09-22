@@ -3,271 +3,138 @@ name: Deploy Frontend to AWS
 on:
   push:
     branches: [ main ]
-  pull_request:
-    branches: [ main ]
 
 env:
   AWS_REGION: us-east-1
-  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-  ECR_REPOSITORY: ${{ secrets.FRONTEND_ECR_REPOSITORY }}
   ASG_NAME: ${{ secrets.FRONTEND_ASG_NAME }}
+  ECR_REPOSITORY: ${{ secrets.FRONTEND_ECR_REPOSITORY }}
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Configure AWS credentials
-      uses: aws-actions/configure-aws-credentials@v4
-      with:
-        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ env.AWS_REGION }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-    - name: Login to Amazon ECR
-      id: login-ecr
-      uses: aws-actions/amazon-ecr-login@v2
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Build, tag, and push image to Amazon ECR
-      id: build-image
-      env:
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ secrets.FRONTEND_ECR_REPOSITORY }}
-        IMAGE_TAG: latest
-      run: |
-        # Build the Docker image
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        
-        # Also tag with the commit SHA
-        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-        
-        # Push both tags
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-        
-        echo "IMAGE=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_ENV
+      - name: Build and push Docker image
+        run: |
+          IMAGE_TAG=latest
+          IMAGE_URI=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:$IMAGE_TAG
 
-    - name: Create new launch template version
-      run: |
-        # Get current launch template ID
-        LAUNCH_TEMPLATE_ID=$(aws autoscaling describe-auto-scaling-groups \
-          --auto-scaling-group-names $ASG_NAME \
-          --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
-          --output text)
-        
-        echo "Launch Template ID: $LAUNCH_TEMPLATE_ID"
-        
-        # Create user data script using a here document to avoid YAML issues
-        cat > user-data.sh << 'EOF'
-        #!/bin/bash
-        apt-get update -y
-        apt-get install -y docker.io git nginx awscli jq
-        systemctl start docker
-        systemctl enable docker
-        usermod -a -G docker ubuntu
+          echo "Building Docker image: $IMAGE_URI"
+          docker build -t $IMAGE_URI .
+          docker push $IMAGE_URI
 
-        curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-        apt-get install -y nodejs
+          # Also push commit SHA for rollback capability
+          docker tag $IMAGE_URI ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          docker push ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
 
-        snap install amazon-ssm-agent --classic
-        systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
-        systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-        mkdir -p /opt/djangobnb-frontend
-        chown ubuntu:ubuntu /opt/djangobnb-frontend
+      - name: Prepare user-data script
+        run: |
+          cat > user-data.sh <<'EOF'
+          #!/bin/bash
+          set -euo pipefail
 
-        REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-        ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+          apt-get update -y
+          apt-get install -y ca-certificates curl gnupg unzip lsb-release git nginx jq docker.io
 
-        aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+          systemctl enable docker
+          systemctl start docker
 
-        docker pull $ECR_REGISTRY/ECR_REPOSITORY_VALUE:latest
+          # AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -o awscliv2.zip
+          ./aws/install
+          rm -rf awscliv2.zip aws
 
-        docker stop frontend-container 2>/dev/null || true
-        docker rm frontend-container 2>/dev/null || true
+          # Node.js 18
+          curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+          apt-get install -y nodejs
 
-        docker run -d --name frontend-container --restart=always -p 3000:3000 \
-          -e NEXT_PUBLIC_API_HOST=http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com \
-          -e ENVIRONMENT=dev \
-          $ECR_REGISTRY/ECR_REPOSITORY_VALUE:latest
+          # Amazon SSM Agent
+          snap install amazon-ssm-agent --classic
+          systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+          systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
 
-        cat > /etc/nginx/sites-available/default << 'NGINX_EOF'
-        server {
-            listen 80;
-            server_name _;
-            location / {
-                proxy_pass http://localhost:3000;
-                proxy_http_version 1.1;
-                proxy_set_header Upgrade $http_upgrade;
-                proxy_set_header Connection 'upgrade';
-                proxy_set_header Host $host;
-                proxy_set_header X-Real-IP $remote_addr;
-                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-                proxy_set_header X-Forwarded-Proto $scheme;
-                proxy_cache_bypass $http_upgrade;
-            }
-        }
-        NGINX_EOF
+          mkdir -p /opt/djangobnb-frontend
+          chown ubuntu:ubuntu /opt/djangobnb-frontend
 
-        systemctl restart nginx
-        systemctl enable nginx
-        EOF
-        
-        # Replace placeholder with actual repository name
-        sed -i "s/ECR_REPOSITORY_VALUE/$ECR_REPOSITORY/g" user-data.sh
-        
-        # Encode user data
-        USER_DATA=$(base64 -w 0 user-data.sh)
-        
-        # Create new version of launch template
-        aws ec2 create-launch-template-version \
-          --launch-template-id $LAUNCH_TEMPLATE_ID \
-          --source-version '$Latest' \
-          --launch-template-data "{\"ImageId\":\"ami-0866a3c8686eaeeba\",\"UserData\":\"$USER_DATA\"}"
+          # Get region using IMDSv2
+          TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+          REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | jq -r .region)
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
-    - name: Handle existing instance refresh and start new one
-      run: |
-        echo "Checking for existing instance refreshes for ASG: $ASG_NAME"
-        
-        # Check if there's an existing instance refresh in progress
-        EXISTING_REFRESH=$(aws autoscaling describe-instance-refreshes \
-          --auto-scaling-group-name $ASG_NAME \
-          --query 'InstanceRefreshes[?Status==`InProgress` || Status==`Pending`] | [0].InstanceRefreshId' \
-          --output text 2>/dev/null || echo "None")
-        
-        if [ "$EXISTING_REFRESH" != "None" ] && [ "$EXISTING_REFRESH" != "null" ]; then
-          echo "Found existing instance refresh: $EXISTING_REFRESH"
-          
-          # Cancel the existing refresh (only takes ASG name, cancels the active one)
-          echo "Cancelling existing instance refresh..."
-          aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name $ASG_NAME
-          
-          # Wait for cancellation to complete
-          echo "Waiting for cancellation to complete..."
-          while true; do
-            STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name $ASG_NAME \
-              --instance-refresh-ids $EXISTING_REFRESH \
-              --query 'InstanceRefreshes[0].Status' \
-              --output text 2>/dev/null || echo "NotFound")
-            
-            echo "Cancellation status: $STATUS"
-            
-            if [ "$STATUS" = "Cancelled" ] || [ "$STATUS" = "Failed" ] || [ "$STATUS" = "NotFound" ]; then
-              echo "Previous refresh cancelled/completed"
-              break
-            fi
-            
-            sleep 10
-          done
-          
-          # Wait a bit more to ensure AWS is ready
-          sleep 5
-        else
-          echo "No existing instance refresh found"
-        fi
-        
-        echo "Starting new instance refresh for ASG: $ASG_NAME"
-        
-        REFRESH_ID=$(aws autoscaling start-instance-refresh \
-          --auto-scaling-group-name $ASG_NAME \
-          --preferences '{
-            "InstanceWarmup": 300,
-            "MinHealthyPercentage": 50,
-            "CheckpointPercentages": [50, 100],
-            "CheckpointDelay": 600
-          }' \
-          --query 'InstanceRefreshId' \
-          --output text)
-        
-        echo "Instance refresh started with ID: $REFRESH_ID"
-        echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+          # Login & pull
+          aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+          docker pull $ECR_REGISTRY/ECR_REPOSITORY_VALUE:latest
 
-    - name: Wait for instance refresh completion
-      run: |
-        echo "Waiting for instance refresh $REFRESH_ID to complete..."
-        
-        # Set a timeout (30 minutes = 1800 seconds)
-        TIMEOUT=1800
-        ELAPSED=0
-        
-        while [ $ELAPSED -lt $TIMEOUT ]; do
-          STATUS=$(aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name $ASG_NAME \
-            --instance-refresh-ids $REFRESH_ID \
-            --query 'InstanceRefreshes[0].Status' \
+          # Restart container
+          docker stop frontend-container 2>/dev/null || true
+          docker rm frontend-container 2>/dev/null || true
+          docker run -d --name frontend-container --restart=always -p 3000:3000 \
+            -e NEXT_PUBLIC_API_HOST=http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com \
+            -e ENVIRONMENT=dev \
+            $ECR_REGISTRY/ECR_REPOSITORY_VALUE:latest
+
+          # Nginx reverse proxy
+          cat > /etc/nginx/sites-available/default << 'NGINX_EOF'
+          server {
+              listen 80;
+              server_name _;
+              location / {
+                  proxy_pass http://localhost:3000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                  proxy_cache_bypass $http_upgrade;
+              }
+          }
+          NGINX_EOF
+
+          systemctl restart nginx
+          systemctl enable nginx
+          EOF
+
+          sed -i "s/ECR_REPOSITORY_VALUE/${{ env.ECR_REPOSITORY }}/g" user-data.sh
+
+          USER_DATA=$(base64 -w 0 user-data.sh)
+          echo "USER_DATA=$USER_DATA" >> $GITHUB_ENV
+
+      - name: Update Launch Template
+        run: |
+          LAUNCH_TEMPLATE_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names $ASG_NAME \
+            --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
             --output text)
-          
-          PERCENTAGE=$(aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name $ASG_NAME \
-            --instance-refresh-ids $REFRESH_ID \
-            --query 'InstanceRefreshes[0].PercentageComplete' \
-            --output text 2>/dev/null || echo "0")
-          
-          echo "Current status: $STATUS (${PERCENTAGE}% complete)"
-          
-          case $STATUS in
-            "Successful")
-              echo "✅ Instance refresh completed successfully!"
-              break
-              ;;
-            "Failed"|"Cancelled")
-              echo "❌ Instance refresh failed with status: $STATUS"
-              
-              # Get failure details
-              aws autoscaling describe-instance-refreshes \
-                --auto-scaling-group-name $ASG_NAME \
-                --instance-refresh-ids $REFRESH_ID \
-                --query 'InstanceRefreshes[0].StatusReason' \
-                --output text
-              exit 1
-              ;;
-            "InProgress"|"Pending")
-              echo "⏳ Instance refresh in progress, waiting 60 seconds..."
-              sleep 60
-              ELAPSED=$((ELAPSED + 60))
-              ;;
-            *)
-              echo "Unknown status: $STATUS"
-              sleep 60
-              ELAPSED=$((ELAPSED + 60))
-              ;;
-          esac
-        done
-        
-        if [ $ELAPSED -ge $TIMEOUT ]; then
-          echo "❌ Instance refresh timed out after 30 minutes"
-          echo "Current status was: $STATUS"
-          
-          # Check for any issues
-          aws autoscaling describe-instance-refreshes \
-            --auto-scaling-group-name $ASG_NAME \
-            --instance-refresh-ids $REFRESH_ID \
-            --query 'InstanceRefreshes[0]' \
-            --output json
-          
-          exit 1
-        fi
 
-    - name: Verify deployment
-      run: |
-        echo "🚀 Frontend deployment completed!"
-        echo "Application URL: http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com"
-        echo "Docker Image: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
-        echo "Git Commit: ${{ github.sha }}"
-        
-        # Wait a bit for health checks
-        echo "Waiting for health checks..."
-        sleep 60
-        
-        # Check if the application is responding
-        if curl -f -s "http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com" > /dev/null; then
-          echo "✅ Application is responding!"
-        else
-          echo "⚠️  Application might still be starting up. Check the load balancer target groups."
-        fi
+          echo "Updating Launch Template: $LAUNCH_TEMPLATE_ID"
+
+          aws ec2 create-launch-template-version \
+            --launch-template-id $LAUNCH_TEMPLATE_ID \
+            --source-version '$Latest' \
+            --launch-template-data "{\"UserData\":\"$USER_DATA\"}"
+
+      - name: Refresh Auto Scaling Group
+        run: |
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name $ASG_NAME \
+            --preferences '{"InstanceWarmup":300,"MinHealthyPercentage":50}'
