@@ -51,59 +51,65 @@ jobs:
         
         echo "Launch Template ID: $LAUNCH_TEMPLATE_ID"
         
-        # Create user data script using printf to avoid YAML issues
-        printf '#!/bin/bash
-apt-get update -y
-apt-get install -y docker.io git nginx awscli jq
-systemctl start docker
-systemctl enable docker
-usermod -a -G docker ubuntu
+        # Create user data script using a here document to avoid YAML issues
+        cat > user-data.sh << 'EOF'
+        #!/bin/bash
+        apt-get update -y
+        apt-get install -y docker.io git nginx awscli jq
+        systemctl start docker
+        systemctl enable docker
+        usermod -a -G docker ubuntu
 
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-apt-get install -y nodejs
+        curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+        apt-get install -y nodejs
 
-snap install amazon-ssm-agent --classic
-systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
-systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+        snap install amazon-ssm-agent --classic
+        systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+        systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
 
-mkdir -p /opt/djangobnb-frontend
-chown ubuntu:ubuntu /opt/djangobnb-frontend
+        mkdir -p /opt/djangobnb-frontend
+        chown ubuntu:ubuntu /opt/djangobnb-frontend
 
-REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+        REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
-aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
+        aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-docker pull $ECR_REGISTRY/%s:latest
+        docker pull $ECR_REGISTRY/ECR_REPOSITORY_VALUE:latest
 
-docker stop frontend-container 2>/dev/null || true
-docker rm frontend-container 2>/dev/null || true
+        docker stop frontend-container 2>/dev/null || true
+        docker rm frontend-container 2>/dev/null || true
 
-docker run -d --name frontend-container --restart=always -p 3000:3000 \
-  -e NEXT_PUBLIC_API_HOST=http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com \
-  -e ENVIRONMENT=dev \
-  $ECR_REGISTRY/%s:latest
+        docker run -d --name frontend-container --restart=always -p 3000:3000 \
+          -e NEXT_PUBLIC_API_HOST=http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com \
+          -e ENVIRONMENT=dev \
+          $ECR_REGISTRY/ECR_REPOSITORY_VALUE:latest
 
-printf "server {
-    listen 80;
-    server_name _;
-    location / {
-        proxy_pass http://localhost:3000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection '"'"'upgrade'"'"';
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_cache_bypass \$http_upgrade;
-    }
-}" > /etc/nginx/sites-available/default
+        cat > /etc/nginx/sites-available/default << 'NGINX_EOF'
+        server {
+            listen 80;
+            server_name _;
+            location / {
+                proxy_pass http://localhost:3000;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection 'upgrade';
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_cache_bypass $http_upgrade;
+            }
+        }
+        NGINX_EOF
 
-systemctl restart nginx
-systemctl enable nginx
-' "$ECR_REPOSITORY" "$ECR_REPOSITORY" > user-data.sh
+        systemctl restart nginx
+        systemctl enable nginx
+        EOF
+        
+        # Replace placeholder with actual repository name
+        sed -i "s/ECR_REPOSITORY_VALUE/$ECR_REPOSITORY/g" user-data.sh
         
         # Encode user data
         USER_DATA=$(base64 -w 0 user-data.sh)
