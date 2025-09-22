@@ -142,11 +142,10 @@ jobs:
         if [ "$EXISTING_REFRESH" != "None" ] && [ "$EXISTING_REFRESH" != "null" ]; then
           echo "Found existing instance refresh: $EXISTING_REFRESH"
           
-          # Cancel the existing refresh
+          # Cancel the existing refresh (only takes ASG name, cancels the active one)
           echo "Cancelling existing instance refresh..."
           aws autoscaling cancel-instance-refresh \
-            --auto-scaling-group-name $ASG_NAME \
-            --instance-refresh-id $EXISTING_REFRESH
+            --auto-scaling-group-name $ASG_NAME
           
           # Wait for cancellation to complete
           echo "Waiting for cancellation to complete..."
