@@ -151,14 +151,24 @@ jobs:
       run: |
         echo "Waiting for instance refresh $REFRESH_ID to complete..."
         
-        while true; do
+        # Set a timeout (30 minutes = 1800 seconds)
+        TIMEOUT=1800
+        ELAPSED=0
+        
+        while [ $ELAPSED -lt $TIMEOUT ]; do
           STATUS=$(aws autoscaling describe-instance-refreshes \
             --auto-scaling-group-name $ASG_NAME \
             --instance-refresh-ids $REFRESH_ID \
             --query 'InstanceRefreshes[0].Status' \
             --output text)
           
-          echo "Current status: $STATUS"
+          PERCENTAGE=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name $ASG_NAME \
+            --instance-refresh-ids $REFRESH_ID \
+            --query 'InstanceRefreshes[0].PercentageComplete' \
+            --output text 2>/dev/null || echo "0")
+          
+          echo "Current status: $STATUS (${PERCENTAGE}% complete)"
           
           case $STATUS in
             "Successful")
@@ -167,18 +177,41 @@ jobs:
               ;;
             "Failed"|"Cancelled")
               echo "❌ Instance refresh failed with status: $STATUS"
+              
+              # Get failure details
+              aws autoscaling describe-instance-refreshes \
+                --auto-scaling-group-name $ASG_NAME \
+                --instance-refresh-ids $REFRESH_ID \
+                --query 'InstanceRefreshes[0].StatusReason' \
+                --output text
               exit 1
               ;;
             "InProgress"|"Pending")
-              echo "⏳ Instance refresh in progress, waiting 30 seconds..."
-              sleep 30
+              echo "⏳ Instance refresh in progress, waiting 60 seconds..."
+              sleep 60
+              ELAPSED=$((ELAPSED + 60))
               ;;
             *)
               echo "Unknown status: $STATUS"
-              sleep 30
+              sleep 60
+              ELAPSED=$((ELAPSED + 60))
               ;;
           esac
         done
+        
+        if [ $ELAPSED -ge $TIMEOUT ]; then
+          echo "❌ Instance refresh timed out after 30 minutes"
+          echo "Current status was: $STATUS"
+          
+          # Check for any issues
+          aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name $ASG_NAME \
+            --instance-refresh-ids $REFRESH_ID \
+            --query 'InstanceRefreshes[0]' \
+            --output json
+          
+          exit 1
+        fi
 
     - name: Verify deployment
       run: |
