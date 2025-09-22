@@ -31,9 +31,32 @@ jobs:
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Verify Dockerfile exists
+      run: |
+        pwd
+        ls -la
+        if [ ! -f "Dockerfile" ]; then
+          echo "Dockerfile not found in root directory"
+          exit 1
+        fi
+
     - name: Build Docker image
       run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+        # Print environment variables for debugging
+        echo "ECR_REGISTRY: $ECR_REGISTRY"
+        echo "ECR_REPOSITORY: $ECR_REPOSITORY"
+        echo "Image tag: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+        
+        # Build Docker image with explicit context
+        docker build \
+          --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+          --file ./Dockerfile \
+          .
+        
+        # Tag with commit SHA
         docker tag $ECR_REGISTRY/$ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
 
     - name: Push Docker image to ECR
