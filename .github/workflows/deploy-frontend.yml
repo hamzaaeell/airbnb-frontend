@@ -1,0 +1,192 @@
+name: Deploy Frontend to AWS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
+  ECR_REPOSITORY: ${{ secrets.FRONTEND_ECR_REPOSITORY }}
+  ASG_NAME: ${{ secrets.FRONTEND_ASG_NAME }}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build Docker image
+      run: |
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+        docker tag $ECR_REGISTRY/$ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+
+    - name: Push Docker image to ECR
+      run: |
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+
+    - name: Create new launch template version
+      run: |
+        # Get current launch template ID
+        LAUNCH_TEMPLATE_ID=$(aws autoscaling describe-auto-scaling-groups \
+          --auto-scaling-group-names $ASG_NAME \
+          --query 'AutoScalingGroups[0].LaunchTemplate.LaunchTemplateId' \
+          --output text)
+        
+        echo "Launch Template ID: $LAUNCH_TEMPLATE_ID"
+        
+        # Create new version of launch template (forces new image pull)
+        aws ec2 create-launch-template-version \
+          --launch-template-id $LAUNCH_TEMPLATE_ID \
+          --source-version '$Latest' \
+          --launch-template-data '{
+            "ImageId": "ami-0866a3c8686eaeeba",
+            "UserData": "'$(echo "#!/bin/bash
+apt-get update -y
+apt-get install -y docker.io git nginx awscli jq
+systemctl start docker
+systemctl enable docker
+usermod -a -G docker ubuntu
+
+# Install Node.js 18
+curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+apt-get install -y nodejs
+
+# Install SSM agent
+snap install amazon-ssm-agent --classic
+systemctl start snap.amazon-ssm-agent.amazon-ssm-agent.service
+systemctl enable snap.amazon-ssm-agent.amazon-ssm-agent.service
+
+# Create app directory
+mkdir -p /opt/djangobnb-frontend
+chown ubuntu:ubuntu /opt/djangobnb-frontend
+
+# Get AWS region and account ID
+REGION=\$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
+ECR_REGISTRY=\"\$ACCOUNT_ID.dkr.ecr.\$REGION.amazonaws.com\"
+
+# Login to ECR
+aws ecr get-login-password --region \$REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY
+
+# Pull and run frontend container with cache busting
+docker pull \$ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+# Stop and remove existing container if it exists
+docker stop frontend-container 2>/dev/null || true
+docker rm frontend-container 2>/dev/null || true
+
+# Start frontend container
+docker run -d --name frontend-container --restart=always -p 3000:3000 \
+  -e NEXT_PUBLIC_API_HOST=http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com \
+  -e ENVIRONMENT=dev \
+  \$ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+# Configure Nginx for Next.js
+cat > /etc/nginx/sites-available/default << 'NGINX_EOF'
+server {
+    listen 80;
+    server_name _;
+    
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+NGINX_EOF
+
+systemctl restart nginx
+systemctl enable nginx" | base64 -w 0)'"
+          }'
+
+    - name: Start instance refresh
+      run: |
+        echo "Starting instance refresh for ASG: $ASG_NAME"
+        
+        REFRESH_ID=$(aws autoscaling start-instance-refresh \
+          --auto-scaling-group-name $ASG_NAME \
+          --preferences '{
+            "InstanceWarmup": 300,
+            "MinHealthyPercentage": 50,
+            "CheckpointPercentages": [50, 100],
+            "CheckpointDelay": 600
+          }' \
+          --query 'InstanceRefreshId' \
+          --output text)
+        
+        echo "Instance refresh started with ID: $REFRESH_ID"
+        echo "REFRESH_ID=$REFRESH_ID" >> $GITHUB_ENV
+
+    - name: Wait for instance refresh completion
+      run: |
+        echo "Waiting for instance refresh $REFRESH_ID to complete..."
+        
+        while true; do
+          STATUS=$(aws autoscaling describe-instance-refreshes \
+            --auto-scaling-group-name $ASG_NAME \
+            --instance-refresh-ids $REFRESH_ID \
+            --query 'InstanceRefreshes[0].Status' \
+            --output text)
+          
+          echo "Current status: $STATUS"
+          
+          case $STATUS in
+            "Successful")
+              echo "✅ Instance refresh completed successfully!"
+              break
+              ;;
+            "Failed"|"Cancelled")
+              echo "❌ Instance refresh failed with status: $STATUS"
+              exit 1
+              ;;
+            "InProgress"|"Pending")
+              echo "⏳ Instance refresh in progress, waiting 30 seconds..."
+              sleep 30
+              ;;
+            *)
+              echo "Unknown status: $STATUS"
+              sleep 30
+              ;;
+          esac
+        done
+
+    - name: Verify deployment
+      run: |
+        echo "🚀 Frontend deployment completed!"
+        echo "Application URL: http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com"
+        echo "Docker Image: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
+        echo "Git Commit: ${{ github.sha }}"
+        
+        # Wait a bit for health checks
+        echo "Waiting for health checks..."
+        sleep 60
+        
+        # Check if the application is responding
+        if curl -f -s "http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com" > /dev/null; then
+          echo "✅ Application is responding!"
+        else
+          echo "⚠️  Application might still be starting up. Check the load balancer target groups."
+        fi
