@@ -51,13 +51,9 @@ jobs:
         
         echo "Launch Template ID: $LAUNCH_TEMPLATE_ID"
         
-        # Create new version of launch template (forces new image pull)
-        aws ec2 create-launch-template-version \
-          --launch-template-id $LAUNCH_TEMPLATE_ID \
-          --source-version '$Latest' \
-          --launch-template-data '{
-            "ImageId": "ami-0866a3c8686eaeeba",
-            "UserData": "'$(echo "#!/bin/bash
+        # Create user data script
+        cat > user-data.sh << 'EOF'
+#!/bin/bash
 apt-get update -y
 apt-get install -y docker.io git nginx awscli jq
 systemctl start docker
@@ -78,15 +74,15 @@ mkdir -p /opt/djangobnb-frontend
 chown ubuntu:ubuntu /opt/djangobnb-frontend
 
 # Get AWS region and account ID
-REGION=\$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
-ACCOUNT_ID=\$(aws sts get-caller-identity --query Account --output text)
-ECR_REGISTRY=\"\$ACCOUNT_ID.dkr.ecr.\$REGION.amazonaws.com\"
+REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+ECR_REGISTRY="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
 
 # Login to ECR
-aws ecr get-login-password --region \$REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY
+aws ecr get-login-password --region $REGION | docker login --username AWS --password-stdin $ECR_REGISTRY
 
-# Pull and run frontend container with cache busting
-docker pull \$ECR_REGISTRY/$ECR_REPOSITORY:latest
+# Pull and run frontend container
+docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
 # Stop and remove existing container if it exists
 docker stop frontend-container 2>/dev/null || true
@@ -96,7 +92,7 @@ docker rm frontend-container 2>/dev/null || true
 docker run -d --name frontend-container --restart=always -p 3000:3000 \
   -e NEXT_PUBLIC_API_HOST=http://dev-djangobnb-alb-720056700.us-east-1.elb.amazonaws.com \
   -e ENVIRONMENT=dev \
-  \$ECR_REGISTRY/$ECR_REPOSITORY:latest
+  $ECR_REGISTRY/$ECR_REPOSITORY:latest
 
 # Configure Nginx for Next.js
 cat > /etc/nginx/sites-available/default << 'NGINX_EOF'
@@ -107,20 +103,29 @@ server {
     location / {
         proxy_pass http://localhost:3000;
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_cache_bypass \$http_upgrade;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_cache_bypass $http_upgrade;
     }
 }
 NGINX_EOF
 
 systemctl restart nginx
-systemctl enable nginx" | base64 -w 0)'"
-          }'
+systemctl enable nginx
+EOF
+        
+        # Encode user data
+        USER_DATA=$(base64 -w 0 user-data.sh)
+        
+        # Create new version of launch template
+        aws ec2 create-launch-template-version \
+          --launch-template-id $LAUNCH_TEMPLATE_ID \
+          --source-version '$Latest' \
+          --launch-template-data "{\"ImageId\":\"ami-0866a3c8686eaeeba\",\"UserData\":\"$USER_DATA\"}"
 
     - name: Start instance refresh
       run: |
