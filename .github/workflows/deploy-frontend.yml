@@ -50,10 +50,11 @@ jobs:
         echo "ECR_REPOSITORY: $ECR_REPOSITORY"
         echo "Image tag: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
         
-        # Build Docker image with explicit context
-        docker build \
+        # Build Docker image using buildx with proper arguments
+        docker buildx build \
           --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
           --file ./Dockerfile \
+          --load \
           .
         
         # Tag with commit SHA
