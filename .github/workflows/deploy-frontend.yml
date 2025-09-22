@@ -40,6 +40,16 @@ jobs:
           exit 1
         fi
 
+    - name: Check Docker configuration
+      run: |
+        echo "Docker version:"
+        docker --version
+        echo "Docker info:"
+        docker info
+        echo "Docker buildx version:"
+        docker buildx version
+        echo "DOCKER_BUILDKIT: $DOCKER_BUILDKIT"
+
     - name: Build Docker image
       run: |
         # Print environment variables for debugging
@@ -47,14 +57,18 @@ jobs:
         echo "ECR_REPOSITORY: $ECR_REPOSITORY"
         echo "Image tag: $ECR_REGISTRY/$ECR_REPOSITORY:latest"
         
+        # Force classic builder
+        export DOCKER_BUILDKIT=0
+        
         # Build Docker image using standard docker build
-        docker build \
-          --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
-          --file ./Dockerfile \
-          .
+        echo "Building image..."
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest -f Dockerfile .
         
         # Tag with commit SHA
+        echo "Tagging image..."
         docker tag $ECR_REGISTRY/$ECR_REPOSITORY:latest $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+        
+        echo "Build completed successfully"
 
     - name: Push Docker image to ECR
       run: |
